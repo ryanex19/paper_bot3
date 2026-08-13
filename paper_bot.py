@@ -33,6 +33,7 @@ CRYPTO_KEYWORDS = [
     "crypto",
 ]
 
+# REST & WebSocket Endpoints
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 WS_CLOB_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -48,14 +49,14 @@ active_markets = {}  # {market_id: {title, up_token, down_token, up_asks, down_a
 token_to_market = {}  # {token_id: (market_id, outcome_type)}
 
 session = requests.Session()
-session.headers.update({"User-Agent": "PolymarketCryptoWSBot/6.0"})
+session.headers.update({"User-Agent": "PolymarketCryptoWSBot/6.1"})
 
 
 # ==========================================
 # HELPER FUNCTIONS (SLIPPAGE & FEES)
 # ==========================================
 def calculate_vwap_and_slippage(asks, target_usd):
-    """Walks the order book asks array to calculate VWAP price and slippage percentage for a given USD trade size."""
+    """Walks the order book asks array to calculate VWAP price and slippage percentage for a target trade size in USD."""
     if not asks:
         return None, 0.0, 0.0
 
@@ -72,7 +73,7 @@ def calculate_vwap_and_slippage(asks, target_usd):
 
     for ask in sorted_asks:
         price = float(ask.get("price", 0))
-        size = float(ask.get("size", 0))  # Available shares at this price level
+        size = float(ask.get("size", 0))  # Available shares at level
 
         if price <= 0 or size <= 0:
             continue
@@ -90,7 +91,7 @@ def calculate_vwap_and_slippage(asks, target_usd):
             total_cost += level_usd_available
             remaining_usd -= level_usd_available
 
-    # If the order book is too thin to fill target size
+    # Insufficient depth to fill target spend
     if remaining_usd > 0 or total_shares == 0:
         return None, 0.0, 0.0
 
@@ -143,7 +144,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ==========================================
-# REST DISCOVERY
+# REST MARKET DISCOVERY
 # ==========================================
 def is_crypto_market(market):
     title = (market.get("question") or market.get("title") or "").lower()
@@ -201,7 +202,7 @@ def fetch_crypto_markets():
 
 
 # ==========================================
-# ARBITRAGE ENGINE (WITH SLIPPAGE & GAS)
+# ARBITRAGE ENGINE
 # ==========================================
 def evaluate_arbitrage(market_id):
     global balance
@@ -213,7 +214,6 @@ def evaluate_arbitrage(market_id):
     title = m_data.get("title")
     target_spend_per_side = MAX_TRADE_SIZE / 2.0  # $22.50 per side
 
-    # Compute VWAP and Slippage for both UP and DOWN order books
     up_vwap, up_slippage, up_best = calculate_vwap_and_slippage(
         m_data.get("up_asks", []), target_spend_per_side
     )
@@ -224,11 +224,10 @@ def evaluate_arbitrage(market_id):
     if up_vwap is None or down_vwap is None:
         return
 
-    # Effective cost based on filled order book depth
     combined_cost = up_vwap + down_vwap
     gross_edge = 1.0 - combined_cost
 
-    # Filter invalid / stale order books
+    # Filter out corrupt/stale order books
     if combined_cost < 0.90:
         return
 
@@ -236,11 +235,9 @@ def evaluate_arbitrage(market_id):
         if balance < MAX_TRADE_SIZE:
             return
 
-        # Calculate exact share quantities based on VWAP
         up_shares = target_spend_per_side / up_vwap
         down_shares = target_spend_per_side / down_vwap
 
-        # Shares payout guaranteed = min(up_shares, down_shares) * $1.00
         executable_shares = min(up_shares, down_shares)
         guaranteed_payout = executable_shares * 1.0
 
@@ -248,23 +245,20 @@ def evaluate_arbitrage(market_id):
             executable_shares * down_vwap
         )
 
-        # Calculate Polymarket Taker Fees
         up_fee = calculate_polymarket_taker_fee(executable_shares, up_vwap)
         down_fee = calculate_polymarket_taker_fee(
             executable_shares, down_vwap
         )
         total_taker_fee = up_fee + down_fee
 
-        # Calculate Net Profit after Taker Fees & Polygon Gas
         total_costs_with_fees = trade_cost + total_taker_fee + EST_GAS_FEE_USD
         net_profit = guaranteed_payout - total_costs_with_fees
         net_edge_pct = (net_profit / trade_cost) * 100
 
-        # Don't trigger if fees ate the entire edge
+        # Don't execute if total fees consume net profit
         if net_profit <= 0:
             return
 
-        # Execute Paper Trade
         balance += net_profit
 
         trade_record = {
@@ -315,6 +309,7 @@ def evaluate_arbitrage(market_id):
 # WEBSOCKET STREAM HANDLER
 # ==========================================
 async def market_discovery_loop():
+    """Refreshes market list every 60s."""
     global active_markets, token_to_market
     while True:
         new_markets, new_tokens = fetch_crypto_markets()
@@ -328,6 +323,7 @@ async def market_discovery_loop():
 
 
 async def websocket_listener():
+    """Main WebSocket loop that processes real-time order book events."""
     global active_markets, token_to_market
 
     while True:
@@ -346,6 +342,7 @@ async def websocket_listener():
                 last_sub_time = time.time()
 
                 async for message in ws:
+                    # Periodically update subscriptions if new markets were discovered
                     if time.time() - last_sub_time > 30:
                         current_tokens = list(token_to_market.keys())
                         if len(current_tokens) > len(asset_ids):
@@ -360,22 +357,68 @@ async def websocket_listener():
                             )
                         last_sub_time = time.time()
 
-                    data = json.loads(message)
-                    event_type = data.get("event_type")
+                    raw_data = json.loads(message)
 
-                    if event_type in ["book", "price_change"]:
-                        asset_id = data.get("asset_id")
-                        asks = data.get("asks", [])
+                    # Handle single object vs list batch messages safely
+                    events = (
+                        raw_data if isinstance(raw_data, list) else [raw_data]
+                    )
 
-                        if asset_id in token_to_market and asks:
-                            market_id, outcome_type = token_to_market[asset_id]
+                    for data in events:
+                        if not isinstance(data, dict):
+                            continue
 
-                            if outcome_type == "UP":
-                                active_markets[market_id]["up_asks"] = asks
-                            else:
-                                active_markets[market_id]["down_asks"] = asks
+                        event_type = data.get("event_type")
 
-                            evaluate_arbitrage(market_id)
+                        # 1. Full Order Book Snapshots
+                        if event_type == "book":
+                            asset_id = data.get("asset_id")
+                            asks = data.get("asks", [])
+
+                            if asset_id in token_to_market and asks:
+                                market_id, outcome_type = token_to_market[
+                                    asset_id
+                                ]
+
+                                if outcome_type == "UP":
+                                    active_markets[market_id]["up_asks"] = asks
+                                else:
+                                    active_markets[market_id][
+                                        "down_asks"
+                                    ] = asks
+
+                                evaluate_arbitrage(market_id)
+
+                        # 2. Incremental Price Changes
+                        elif event_type == "price_change":
+                            price_changes = data.get("price_changes", [])
+                            for change in price_changes:
+                                asset_id = change.get("asset_id")
+                                if asset_id in token_to_market:
+                                    market_id, outcome_type = token_to_market[
+                                        asset_id
+                                    ]
+
+                                    best_ask = change.get("best_ask")
+                                    if best_ask:
+                                        new_ask = [
+                                            {
+                                                "price": float(best_ask),
+                                                "size": float(
+                                                    change.get("size", 100)
+                                                ),
+                                            }
+                                        ]
+                                        if outcome_type == "UP":
+                                            active_markets[market_id][
+                                                "up_asks"
+                                            ] = new_ask
+                                        else:
+                                            active_markets[market_id][
+                                                "down_asks"
+                                            ] = new_ask
+
+                                        evaluate_arbitrage(market_id)
 
         except (websockets.ConnectionClosed, Exception) as e:
             logger.warning(
@@ -386,7 +429,7 @@ async def websocket_listener():
 
 async def main():
     print("=" * 75, flush=True)
-    print("   POLYMARKET WEBSOCKET BOT V6.0 (SLIPPAGE & GAS ESTIMATION)")
+    print("   POLYMARKET WEBSOCKET BOT V6.1 (COMPLETE FIXES)")
     print("=" * 75, flush=True)
     print(f" Initial Balance : ${INITIAL_BALANCE:.2f}", flush=True)
     print(f" Est. Gas Fee    : ${EST_GAS_FEE_USD:.2f} / trade", flush=True)
