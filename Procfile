@@ -1,0 +1,1 @@
+worker: python paper_bot.py
