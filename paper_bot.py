@@ -34,7 +34,7 @@ CRYPTO_KEYWORDS = [
 ]
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
-WS_CLOB_URL = "wss://ws-subscriptions.clob.polymarket.com/ws/market"
+WS_CLOB_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
