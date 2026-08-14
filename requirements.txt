@@ -1,3 +1,4 @@
 requests
 websockets
+py-clob-client
 python-dotenv
